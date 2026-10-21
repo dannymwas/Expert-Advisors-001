@@ -1,0 +1,324 @@
+study("EURUSD Overnight Sweep & Reclaim", shorttitle="EU OSR", overlay=true)
+
+// =========================================================================
+// EURUSD Overnight (Sydney) Range - Liquidity Sweep + Reclaim
+// GoCharting Lipi Script Version
+// =========================================================================
+
+// ------------------------------- INPUTS ---------------------------------
+TZ          = input("Timezone (EAT = Africa/Nairobi)", "Africa/Nairobi")
+rangeS      = input("Overnight range", "0000-0900")
+winS        = input("Entry window (no new trades outside)", "0900-1400")
+flatHour    = input("Force flat from this hour", 22)
+skipMon     = input("Skip Mondays", false)
+
+pip         = input("Pip size", 0.0001)
+minRange    = input("Min range (pips)", 15.0)
+maxRange    = input("Max range (pips)", 80.0)
+sweepMin    = input("Min sweep beyond range (pips)", 1.0)
+maxDepth    = input("Max sweep depth (pips, 0 = off)", 15.0)
+reentryBuf  = input("Re-entry close buffer (pips)", 0.0)
+confirmBars = input("Confirm within N bars of last sweep extreme", 6)
+sameBar     = input("Allow confirmation on the sweep candle itself", true)
+
+m15Mode     = input("M15 structure filter", "Off") // Options: Off, Aligned, Not opposing
+pivN        = input("M15 pivot bars each side", 3)
+useDisp     = input("Require displacement candle", false)
+dispMult    = input("Displacement: body >= x avg M5 range(20)", 1.5)
+dispBody    = input("Displacement: body/range >=", 0.6)
+useFVG      = input("Require 3-candle FVG at confirmation", false)
+fvgMin      = input("FVG min size (pips)", 0.5)
+
+entryModel  = input("Entry model", "A: Market") // Options: A: Market, B: Retrace limit
+retr        = input("B: retrace fraction of sweep->confirm leg", 0.5)
+expiryBars  = input("B: cancel limit after N bars", 6)
+
+stopBuf     = input("Stop buffer beyond sweep extreme (pips)", 1.0)
+minStop     = input("Min stop (pips)", 5.0)
+maxStop     = input("Max stop (pips)", 25.0)
+tpModel     = input("TP model", "Fixed R") // Options: Fixed R, Structure (M15), Hybrid
+tpR         = input("Fixed R multiple", 2.0)
+minStructR  = input("Structure/Hybrid: min R to structure target", 1.5)
+useBE       = input("Breakeven ON", true)
+beR         = input("Breakeven trigger (R)", 1.0)
+beBuf       = input("Breakeven buffer (pips)", 0.5)
+
+riskPct      = input("Risk per trade (% equity)", 0.5)
+maxTradesDay = input("Max trades per day", 1)
+spreadPips   = input("Assumed spread (pips) - cost filter only", 0.6)
+commPips     = input("Commission round-turn (pips)", 0.7)
+maxCostFrac  = input("Max (spread+commission) as fraction of R", 0.15)
+
+// ------------------------------ HELPERS ---------------------------------
+inS(s) => timeinrange(s)
+
+// M15 structure calculation
+m15Struct(n) =>
+    ph = pivothigh(high[1], n, n)
+    pl = pivotlow(low[1], n, n)
+    var float h1 = na
+    var float h2 = na
+    var float l1 = na
+    var float l2 = na
+    if not na(ph)
+        h2 := h1
+        h1 := ph
+    if not na(pl)
+        l2 := l1
+        l1 := pl
+    d = (h1 > h2 and l1 > l2) ? 1 : ((h1 < h2 and l1 < l2) ? -1 : 0)
+    [d, h1, h2, l1, l2]
+
+[d15, h15a, h15b, l15a, l15b] = security(symbol, "15", m15Struct(pivN))
+
+nearestAbove(a, b, x) =>
+    float r = na
+    if not na(a) and a > x
+        r := a
+    if not na(b) and b > x
+        r := na(r) ? b : min(r, b)
+    r
+
+nearestBelow(a, b, x) =>
+    float r = na
+    if not na(a) and a < x
+        r := a
+    if not na(b) and b < x
+        r := na(r) ? b : max(r, b)
+    r
+
+// Setup evaluation
+setup(dir, ext) =>
+    stopP = ext - dir * stopBuf * pip
+    entP = entryModel == "A: Market" ? close : close - retr * (close - ext)
+    riskP = dir * (entP - stopP)
+    stopPips = riskP / pip
+    costOK = riskP > 0 and (spreadPips + commPips) / stopPips <= maxCostFrac
+    sizeOK = stopPips >= minStop and stopPips <= maxStop
+    fixedP = entP + dir * tpR * riskP
+    structRaw = dir == 1 ? nearestAbove(h15a, h15b, entP) : nearestBelow(l15a, l15b, entP)
+    structOK = not na(structRaw) and riskP > 0 and dir * (structRaw - entP) / riskP >= minStructR
+    float tpP = na
+    float tpS = na
+    if tpModel == "Fixed R"
+        tpP := fixedP
+    else if tpModel == "Structure (M15)"
+        tpP := structOK ? structRaw : na
+        tpS := tpP
+    else
+        tpP := structOK ? structRaw : fixedP
+        tpS := structOK ? structRaw : na
+    ok = costOK and sizeOK and not na(tpP)
+    [ok, entP, stopP, tpP, tpS, riskP]
+
+riskQty(riskP, eq) =>
+    cash = riskPct / 100.0 * eq
+    raw = riskP > 0 ? cash / riskP : 0.0
+    floor(raw / 1000.0) * 1000.0
+
+// ------------------------------- TIME -----------------------------------
+inRange   = inS(rangeS)
+inWin     = inS(winS)
+hr        = hour()
+forceFlat = hr >= flatHour
+isMon     = dayofweek() == 2
+newRange  = inRange and not inRange[1]
+tfOK      = timeframe == "5"
+
+// ------------------------------ STATE -----------------------------------
+var float rH = na
+var float rL = na
+var float sLow = na
+var float sHigh = na
+var int   sLowBar = na
+var int   sHighBar = na
+var bool  lowDead = false
+var bool  highDead = false
+var int   tradesToday = 0
+
+var int   pendBar = na
+var int   pDir = 0
+var float pStop = na
+var float pTPs = na
+
+var float entryPx = na
+var float curStop = na
+var float curTP = na
+var float curRisk = na
+var float curRiskCash = na
+var int   curDir = 0
+var bool  beDone = false
+var int   posSize = 0
+
+var int   closedSeen = 0
+var float lastNet = 0.0
+var int   nTr = 0
+var int   nWin = 0
+var int   nBE = 0
+var float sumR = 0.0
+var float grossW = 0.0
+var float grossL = 0.0
+var int   nLng = 0
+var float sumRL = 0.0
+var int   nSht = 0
+var float sumRS = 0.0
+
+if newRange
+    rH := high
+    rL := low
+    sLow := na
+    sHigh := na
+    sLowBar := na
+    sHighBar := na
+    lowDead := false
+    highDead := false
+    tradesToday := 0
+else if inRange
+    rH := na(rH) ? high : max(rH, high)
+    rL := na(rL) ? low : min(rL, low)
+
+rangeReady = not inRange and not na(rH) and not na(rL)
+rngPips    = (rH - rL) / pip
+rangeOK    = rngPips >= minRange and rngPips <= maxRange
+active     = rangeReady and rangeOK and not (skipMon and isMon)
+
+// ------------------------- SWEEP TRACKING -------------------------------
+if not na(sLowBar) and barindex - sLowBar > confirmBars
+    sLow := na
+    sLowBar := na
+if not na(sHighBar) and barindex - sHighBar > confirmBars
+    sHigh := na
+    sHighBar := na
+
+if active and not lowDead and low <= rL - sweepMin * pip
+    if maxDepth > 0 and (rL - low) > maxDepth * pip
+        lowDead := true
+        sLow := na
+        sLowBar := na
+    else if na(sLow) or low < sLow
+        sLow := low
+        sLowBar := barindex
+
+if active and not highDead and high >= rH + sweepMin * pip
+    if maxDepth > 0 and (high - rH) > maxDepth * pip
+        highDead := true
+        sHigh := na
+        sHighBar := na
+    else if na(sHigh) or high > sHigh
+        sHigh := high
+        sHighBar := barindex
+
+// ---------------------------- CONFIRMATION ------------------------------
+confL = active and not na(sLow) and close > rL + reentryBuf * pip and close < rH and (sameBar or barindex > sLowBar)
+confS = active and not na(sHigh) and close < rH - reentryBuf * pip and close > rL and (sameBar or barindex > sHighBar)
+
+atrPrev = atr(20)[1]
+body    = abs(close - open)
+rng     = high - low
+dispL = not useDisp or (close > open and body >= dispMult * atrPrev and rng > 0 and body / rng >= dispBody)
+dispS = not useDisp or (close < open and body >= dispMult * atrPrev and rng > 0 and body / rng >= dispBody)
+fvgL  = not useFVG or (low - high[2] >= fvgMin * pip)
+fvgS  = not useFVG or (low[2] - high >= fvgMin * pip)
+m15L  = m15Mode == "Off" or (m15Mode == "Aligned" ? d15 == 1 : d15 != -1)
+m15S  = m15Mode == "Off" or (m15Mode == "Aligned" ? d15 == -1 : d15 != 1)
+
+[okL, entL, stpL, tpL, tpSL, rskL] = setup(1, sLow)
+[okS, entS, stpS, tpS, tpSS, rskS] = setup(-1, sHigh)
+
+canTrade = inWin and not forceFlat and posSize == 0 and na(pendBar) and tradesToday < maxTradesDay
+longSig  = canTrade and confL and okL and dispL and fvgL and m15L
+shortSig = canTrade and confS and okS and dispS and fvgS and m15S and not longSig
+
+// ------------------------------ ORDERS ----------------------------------
+if longSig
+    q = riskQty(rskL, 10000.0)
+    if q > 0
+        pDir := 1
+        pStop := stpL
+        pTPs := tpSL
+        pendBar := barindex
+        sLow := na
+        sLowBar := na
+
+if shortSig
+    q = riskQty(rskS, 10000.0)
+    if q > 0
+        pDir := -1
+        pStop := stpS
+        pTPs := tpSS
+        pendBar := barindex
+        sHigh := na
+        sHighBar := na
+
+// ---------------------- FILL / POSITION MANAGEMENT ----------------------
+justFilled = posSize != 0 and posSize[1] == 0
+posDir = posSize > 0 ? 1 : -1
+
+if justFilled
+    entryPx := close
+    curRisk := abs(entryPx - pStop)
+    curStop := pStop
+    curTP := not na(pTPs) ? pTPs : entryPx + posDir * tpR * curRisk
+    curRiskCash := curRisk * abs(posSize)
+    curDir := posDir
+    beDone := false
+    tradesToday += 1
+    pendBar := na
+
+if posSize != 0
+    if useBE and not beDone and not justFilled
+        hit = posDir == 1 ? high >= entryPx + beR * curRisk : low <= entryPx - beR * curRisk
+        if hit
+            beDone := true
+            curStop := entryPx + posDir * beBuf * pip
+
+// Pending order housekeeping
+if not na(pendBar) and posSize == 0
+    limitModel = entryModel != "A: Market"
+    expired = barindex - pendBar > (limitModel ? expiryBars : 1)
+    invalid = limitModel and (pDir == 1 ? close < pStop : close > pStop)
+    if expired or invalid
+        pendBar := na
+
+// End-of-day flat
+if forceFlat
+    pendBar := na
+    posSize := 0
+
+// ------------------------------- PLOTS ----------------------------------
+plot(newRange ? na : rH, "Range High", color=color.orange, linewidth=2)
+plot(newRange ? na : rL, "Range Low", color=color.orange, linewidth=2)
+plot(posSize != 0 ? curStop : na, "Stop", color=color.red)
+plot(posSize != 0 ? curTP : na, "Target", color=color.green)
+
+plotarrow(not na(sLowBar) and sLowBar == barindex ? 1 : na, "Low sweep", colorup=color.orange)
+plotarrow(not na(sHighBar) and sHighBar == barindex ? -1 : na, "High sweep", colordown=color.orange)
+plotarrow(longSig ? 1 : (shortSig ? -1 : na), "Trade Execution")
+
+bgcolor(inRange ? color.new(color.blue, 92) : na)
+bgcolor(inWin and rangeReady ? color.new(color.green, 95) : na)
+
+// ------------------------------- TABLE ----------------------------------
+var table tb = table.new(position.top_right, 2, 11, bgcolor=color.new(color.black, 70))
+
+if islastbar
+    expR = nTr > 0 ? sumR / nTr : na
+    pf = grossL > 0 ? grossW / grossL : na
+    table.cell(tb, 0, 0, "Timeframe")
+    table.cell(tb, 1, 0, tfOK ? "M5 OK" : "USE M5!", text_color=tfOK ? color.green : color.red)
+    table.cell(tb, 0, 1, "Range (pips)")
+    table.cell(tb, 1, 1, na(rngPips) ? "-" : str(rngPips), text_color=rangeOK ? color.green : color.orange)
+    table.cell(tb, 0, 2, "Trades today")
+    table.cell(tb, 1, 2, str(tradesToday) + "/" + str(maxTradesDay))
+    table.cell(tb, 0, 3, "M15 structure")
+    table.cell(tb, 1, 3, d15 == 1 ? "UP" : (d15 == -1 ? "DOWN" : "RANGE"), text_color=color.blue)
+    table.cell(tb, 0, 4, "Closed trades")
+    table.cell(tb, 1, 4, str(nTr))
+    table.cell(tb, 0, 5, "Win rate")
+    table.cell(tb, 1, 5, nTr > 0 ? str(100.0 * nWin / nTr) + "%" : "-")
+    table.cell(tb, 0, 6, "Expectancy (R)")
+    table.cell(tb, 1, 6, na(expR) ? "-" : str(expR), text_color=na(expR) ? color.gray : (expR > 0 ? color.green : color.red))
+    table.cell(tb, 0, 7, "Total R")
+    table.cell(tb, 1, 7, str(sumR))
+    table.cell(tb, 0, 8, "Profit factor (R)")
+    table.cell(tb, 1, 8, na(pf) ? "-" : str(pf))

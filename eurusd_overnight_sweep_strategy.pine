@@ -1,0 +1,384 @@
+//@version=5
+strategy("EURUSD Overnight Sweep & Reclaim", shorttitle="EU OSR", overlay=true,
+     initial_capital=10000, default_qty_type=strategy.fixed, default_qty_value=1000,
+     commission_type=strategy.commission.cash_per_contract, commission_value=0.000035,
+     slippage=5, margin_long=1, margin_short=1, pyramiding=0,
+     calc_on_every_tick=false, process_orders_on_close=false,
+     max_labels_count=500, max_lines_count=500)
+
+// =========================================================================
+// EURUSD Overnight (Sydney) Range - Liquidity Sweep + Reclaim
+// RUN ON: EURUSD, 5-minute chart.
+// Times are in the timezone below (default EAT = Africa/Nairobi, UTC+3, no DST),
+// so the broker/exchange timezone cannot shift the strategy.
+//
+// Defaults: commission = $3.5/side per 100k (set in Properties to match YOUR broker),
+// slippage = 0.5 pip, margin = 1% (needed so risk-based sizing is not rejected).
+// TradingView does not model spread: "Assumed spread" below only feeds the cost filter.
+// =========================================================================
+
+// ------------------------------- INPUTS ---------------------------------
+gT = "1. Time"
+TZ       = input.string("Africa/Nairobi", "Timezone (EAT = Africa/Nairobi)", group=gT)
+rangeS   = input.session("0000-0900", "Overnight range", group=gT)
+winS     = input.session("0900-1400", "Entry window (no new trades outside)", group=gT)
+flatHour = input.int(22, "Force flat from this hour", minval=1, maxval=23, group=gT)
+skipMon  = input.bool(false, "Skip Mondays", group=gT)
+
+gR = "2. Range & sweep"
+pip        = input.float(0.0001, "Pip size", step=0.0001, group=gR)
+minRange   = input.float(15.0, "Min range (pips)", group=gR)
+maxRange   = input.float(80.0, "Max range (pips)", group=gR)
+sweepMin   = input.float(1.0, "Min sweep beyond range (pips)", step=0.5, group=gR)
+maxDepth   = input.float(15.0, "Max sweep depth (pips, 0 = off)", step=1.0, group=gR)
+reentryBuf = input.float(0.0, "Re-entry close buffer (pips)", step=0.5, group=gR)
+confirmBars = input.int(6, "Confirm within N bars of last sweep extreme", minval=0, group=gR)
+sameBar    = input.bool(true, "Allow confirmation on the sweep candle itself", group=gR)
+
+gF = "3. Optional confluences (test one at a time)"
+m15Mode  = input.string("Off", "M15 structure filter", options=["Off", "Aligned", "Not opposing"], group=gF)
+pivN     = input.int(3, "M15 pivot bars each side", minval=1, group=gF)
+useDisp  = input.bool(false, "Require displacement candle", group=gF)
+dispMult = input.float(1.5, "Displacement: body >= x avg M5 range(20)", step=0.1, group=gF)
+dispBody = input.float(0.6, "Displacement: body/range >=", step=0.05, group=gF)
+useFVG   = input.bool(false, "Require 3-candle FVG at confirmation", group=gF)
+fvgMin   = input.float(0.5, "FVG min size (pips)", step=0.1, group=gF)
+
+gE = "4. Entry model"
+entryModel = input.string("A: Market", "Entry model", options=["A: Market", "B: Retrace limit"], group=gE)
+retr       = input.float(0.5, "B: retrace fraction of sweep->confirm leg", minval=0.1, maxval=0.9, step=0.05, group=gE)
+expiryBars = input.int(6, "B: cancel limit after N bars", minval=1, group=gE)
+
+gX = "5. Stop, target, breakeven"
+stopBuf    = input.float(1.0, "Stop buffer beyond sweep extreme (pips)", step=0.5, group=gX)
+minStop    = input.float(5.0, "Min stop (pips)", group=gX)
+maxStop    = input.float(25.0, "Max stop (pips)", group=gX)
+tpModel    = input.string("Fixed R", "TP model", options=["Fixed R", "Structure (M15)", "Hybrid"], group=gX)
+tpR        = input.float(2.0, "Fixed R multiple", step=0.5, group=gX)
+minStructR = input.float(1.5, "Structure/Hybrid: min R to structure target", step=0.1, group=gX)
+useBE      = input.bool(true, "Breakeven ON", group=gX)
+beR        = input.float(1.0, "Breakeven trigger (R)", step=0.1, group=gX)
+beBuf      = input.float(0.5, "Breakeven buffer (pips)", step=0.1, group=gX)
+
+gK = "6. Risk & costs"
+riskPct     = input.float(0.5, "Risk per trade (% equity)", step=0.1, group=gK)
+maxTradesDay = input.int(1, "Max trades per day (1 = Version A, 2 = Version B)", minval=1, group=gK)
+spreadPips  = input.float(0.6, "Assumed spread (pips) - cost filter only", step=0.1, group=gK)
+commPips    = input.float(0.7, "Commission round-turn (pips)", step=0.1, group=gK)
+maxCostFrac = input.float(0.15, "Max (spread+commission) as fraction of R", step=0.01, group=gK)
+
+// ------------------------------ HELPERS ---------------------------------
+inS(s) => not na(time(timeframe.period, s, TZ))
+
+// M15 structure, computed only from CLOSED bars (everything shifted one bar).
+m15Struct(n) =>
+    ph = ta.pivothigh(high[1], n, n)
+    pl = ta.pivotlow(low[1], n, n)
+    var float h1 = na
+    var float h2 = na
+    var float l1 = na
+    var float l2 = na
+    if not na(ph)
+        h2 := h1
+        h1 := ph
+    if not na(pl)
+        l2 := l1
+        l1 := pl
+    d = (h1 > h2 and l1 > l2) ? 1 : (h1 < h2 and l1 < l2) ? -1 : 0
+    [d, h1, h2, l1, l2]
+
+[d15, h15a, h15b, l15a, l15b] = request.security(syminfo.tickerid, "15", m15Struct(pivN))
+
+nearestAbove(a, b, x) =>
+    float r = na
+    if not na(a) and a > x
+        r := a
+    if not na(b) and b > x
+        r := na(r) ? b : math.min(r, b)
+    r
+
+nearestBelow(a, b, x) =>
+    float r = na
+    if not na(a) and a < x
+        r := a
+    if not na(b) and b < x
+        r := na(r) ? b : math.max(r, b)
+    r
+
+// Evaluate one setup. dir: 1 long, -1 short. ext: sweep extreme.
+setup(dir, ext) =>
+    stopP = ext - dir * stopBuf * pip
+    entP = entryModel == "A: Market" ? close : close - retr * (close - ext)
+    riskP = dir * (entP - stopP)
+    stopPips = riskP / pip
+    costOK = riskP > 0 and (spreadPips + commPips) / stopPips <= maxCostFrac
+    sizeOK = stopPips >= minStop and stopPips <= maxStop
+    fixedP = entP + dir * tpR * riskP
+    structRaw = dir == 1 ? nearestAbove(h15a, h15b, entP) : nearestBelow(l15a, l15b, entP)
+    structOK = not na(structRaw) and riskP > 0 and dir * (structRaw - entP) / riskP >= minStructR
+    float tpP = na
+    float tpS = na
+    if tpModel == "Fixed R"
+        tpP := fixedP
+    else if tpModel == "Structure (M15)"
+        tpP := structOK ? structRaw : na
+        tpS := tpP
+    else
+        tpP := structOK ? structRaw : fixedP
+        tpS := structOK ? structRaw : na
+    ok = costOK and sizeOK and not na(tpP)
+    [ok, entP, stopP, tpP, tpS, riskP]
+
+riskQty(riskP) =>
+    cash = riskPct / 100.0 * strategy.equity
+    raw = riskP > 0 ? cash / riskP : 0.0
+    math.floor(raw / 1000.0) * 1000.0
+
+// ------------------------------- TIME -----------------------------------
+inRange   = inS(rangeS)
+inWin     = inS(winS)
+hr        = hour(time, TZ)
+forceFlat = hr >= flatHour
+isMon     = dayofweek(time, TZ) == dayofweek.monday
+newRange  = inRange and not inRange[1]
+tfOK      = timeframe.in_seconds() == 300
+
+// ------------------------------ STATE -----------------------------------
+var float rH = na
+var float rL = na
+var float sLow = na
+var float sHigh = na
+var int   sLowBar = na
+var int   sHighBar = na
+var bool  lowDead = false
+var bool  highDead = false
+var int   tradesToday = 0
+
+var int   pendBar = na
+var int   pDir = 0
+var float pStop = na
+var float pTPs = na
+
+var float entryPx = na
+var float curStop = na
+var float curTP = na
+var float curRisk = na
+var float curRiskCash = na
+var int   curDir = 0
+var bool  beDone = false
+
+var int   closedSeen = 0
+var float lastNet = 0.0
+var int   nTr = 0
+var int   nWin = 0
+var int   nBE = 0
+var float sumR = 0.0
+var float grossW = 0.0
+var float grossL = 0.0
+var int   nLng = 0
+var float sumRL = 0.0
+var int   nSht = 0
+var float sumRS = 0.0
+
+if newRange
+    rH := high
+    rL := low
+    sLow := na
+    sHigh := na
+    sLowBar := na
+    sHighBar := na
+    lowDead := false
+    highDead := false
+    tradesToday := 0
+else if inRange
+    rH := na(rH) ? high : math.max(rH, high)
+    rL := na(rL) ? low : math.min(rL, low)
+
+rangeReady = not inRange and not na(rH) and not na(rL)
+rngPips    = (rH - rL) / pip
+rangeOK    = rngPips >= minRange and rngPips <= maxRange
+active     = rangeReady and rangeOK and not (skipMon and isMon)
+
+// ------------------------- SWEEP TRACKING -------------------------------
+if not na(sLowBar) and bar_index - sLowBar > confirmBars
+    sLow := na
+    sLowBar := na
+if not na(sHighBar) and bar_index - sHighBar > confirmBars
+    sHigh := na
+    sHighBar := na
+
+if active and not lowDead and low <= rL - sweepMin * pip
+    if maxDepth > 0 and (rL - low) > maxDepth * pip
+        lowDead := true
+        sLow := na
+        sLowBar := na
+    else if na(sLow) or low < sLow
+        sLow := low
+        sLowBar := bar_index
+
+if active and not highDead and high >= rH + sweepMin * pip
+    if maxDepth > 0 and (high - rH) > maxDepth * pip
+        highDead := true
+        sHigh := na
+        sHighBar := na
+    else if na(sHigh) or high > sHigh
+        sHigh := high
+        sHighBar := bar_index
+
+// ---------------------------- CONFIRMATION ------------------------------
+confL = active and not na(sLow) and close > rL + reentryBuf * pip and close < rH and (sameBar or bar_index > sLowBar)
+confS = active and not na(sHigh) and close < rH - reentryBuf * pip and close > rL and (sameBar or bar_index > sHighBar)
+
+atrPrev = ta.atr(20)[1]
+body    = math.abs(close - open)
+rng     = high - low
+dispL = not useDisp or (close > open and body >= dispMult * atrPrev and rng > 0 and body / rng >= dispBody)
+dispS = not useDisp or (close < open and body >= dispMult * atrPrev and rng > 0 and body / rng >= dispBody)
+fvgL  = not useFVG or (low - high[2] >= fvgMin * pip)
+fvgS  = not useFVG or (low[2] - high >= fvgMin * pip)
+m15L  = m15Mode == "Off" or (m15Mode == "Aligned" ? d15 == 1 : d15 != -1)
+m15S  = m15Mode == "Off" or (m15Mode == "Aligned" ? d15 == -1 : d15 != 1)
+
+[okL, entL, stpL, tpL, tpSL, rskL] = setup(1, sLow)
+[okS, entS, stpS, tpS, tpSS, rskS] = setup(-1, sHigh)
+
+canTrade = inWin and not forceFlat and strategy.position_size == 0 and na(pendBar) and tradesToday < maxTradesDay and barstate.isconfirmed
+longSig  = canTrade and confL and okL and dispL and fvgL and m15L
+shortSig = canTrade and confS and okS and dispS and fvgS and m15S and not longSig
+
+// ------------------------------ ORDERS ----------------------------------
+if longSig
+    q = riskQty(rskL)
+    if q > 0
+        if entryModel == "A: Market"
+            strategy.entry("L", strategy.long, qty=q)
+        else
+            strategy.entry("L", strategy.long, qty=q, limit=entL)
+        strategy.exit("XL", "L", stop=stpL, limit=tpL)
+        pDir := 1
+        pStop := stpL
+        pTPs := tpSL
+        pendBar := bar_index
+        sLow := na
+        sLowBar := na
+
+if shortSig
+    q = riskQty(rskS)
+    if q > 0
+        if entryModel == "A: Market"
+            strategy.entry("S", strategy.short, qty=q)
+        else
+            strategy.entry("S", strategy.short, qty=q, limit=entS)
+        strategy.exit("XS", "S", stop=stpS, limit=tpS)
+        pDir := -1
+        pStop := stpS
+        pTPs := tpSS
+        pendBar := bar_index
+        sHigh := na
+        sHighBar := na
+
+// ---------------------- FILL / POSITION MANAGEMENT ----------------------
+justFilled = strategy.position_size != 0 and strategy.position_size[1] == 0
+posDir = strategy.position_size > 0 ? 1 : -1
+
+if justFilled
+    entryPx := strategy.position_avg_price
+    curRisk := math.abs(entryPx - pStop)
+    curStop := pStop
+    curTP := not na(pTPs) ? pTPs : entryPx + posDir * tpR * curRisk
+    curRiskCash := curRisk * math.abs(strategy.position_size)
+    curDir := posDir
+    beDone := false
+    tradesToday += 1
+    pendBar := na
+
+if strategy.position_size != 0
+    if useBE and not beDone and not justFilled
+        hit = posDir == 1 ? high >= entryPx + beR * curRisk : low <= entryPx - beR * curRisk
+        if hit
+            beDone := true
+            curStop := entryPx + posDir * beBuf * pip
+    if posDir == 1
+        strategy.exit("XL", "L", stop=curStop, limit=curTP)
+    else
+        strategy.exit("XS", "S", stop=curStop, limit=curTP)
+
+// Pending order housekeeping (limit expiry / invalidation)
+if not na(pendBar) and strategy.position_size == 0
+    limitModel = entryModel != "A: Market"
+    expired = bar_index - pendBar > (limitModel ? expiryBars : 1)
+    invalid = limitModel and (pDir == 1 ? close < pStop : close > pStop)
+    if expired or invalid
+        strategy.cancel("L")
+        strategy.cancel("S")
+        pendBar := na
+
+// End-of-day flat
+if forceFlat
+    strategy.close_all(comment="EOD")
+    strategy.cancel_all()
+    pendBar := na
+
+// ----------------------- R-MULTIPLE TRACKING ----------------------------
+if strategy.closedtrades > closedSeen
+    closedSeen := strategy.closedtrades
+    r = (not na(curRiskCash) and curRiskCash > 0) ? (strategy.netprofit - lastNet) / curRiskCash : na
+    lastNet := strategy.netprofit
+    if not na(r)
+        nTr += 1
+        sumR += r
+        if r > 0.15
+            nWin += 1
+            grossW += r
+        else if r < -0.15
+            grossL += -r
+        else
+            nBE += 1
+        if curDir == 1
+            nLng += 1
+            sumRL += r
+        else
+            nSht += 1
+            sumRS += r
+
+if strategy.position_size == 0 and na(pendBar)
+    curRiskCash := na
+
+// ------------------------------- PLOTS ----------------------------------
+plot(newRange ? na : rH, "Range High", color=color.orange, linewidth=2, style=plot.style_linebr)
+plot(newRange ? na : rL, "Range Low", color=color.orange, linewidth=2, style=plot.style_linebr)
+plot(strategy.position_size != 0 ? curStop : na, "Stop", color=color.red, style=plot.style_linebr)
+plot(strategy.position_size != 0 ? curTP : na, "Target", color=color.lime, style=plot.style_linebr)
+
+plotshape(not na(sLowBar) and sLowBar == bar_index, "Low sweep", shape.diamond, location.belowbar, color.orange, size=size.tiny)
+plotshape(not na(sHighBar) and sHighBar == bar_index, "High sweep", shape.diamond, location.abovebar, color.orange, size=size.tiny)
+plotshape(longSig, "Long", shape.triangleup, location.belowbar, color.lime, size=size.small, text="L")
+plotshape(shortSig, "Short", shape.triangledown, location.abovebar, color.red, size=size.small, text="S")
+
+bgcolor(inRange ? color.new(color.blue, 92) : na, title="Range build")
+bgcolor(inWin and rangeReady ? color.new(color.green, 95) : na, title="Entry window")
+
+// ------------------------------- TABLE ----------------------------------
+var table tb = table.new(position.top_right, 2, 11, bgcolor=color.new(color.black, 70), border_width=1)
+tcell(r, a, b, c) =>
+    table.cell(tb, 0, r, a, text_color=color.white, text_size=size.small)
+    table.cell(tb, 1, r, b, text_color=c, text_size=size.small)
+
+if barstate.islast
+    expR = nTr > 0 ? sumR / nTr : na
+    pf = grossL > 0 ? grossW / grossL : na
+    tcell(0, "Timeframe", tfOK ? "M5 OK" : "USE M5!", tfOK ? color.lime : color.red)
+    tcell(1, "Range (pips)", na(rngPips) ? "-" : str.tostring(rngPips, "#.#"), rangeOK ? color.lime : color.orange)
+    tcell(2, "Trades today", str.tostring(tradesToday) + "/" + str.tostring(maxTradesDay), color.white)
+    tcell(3, "M15 structure", d15 == 1 ? "UP" : d15 == -1 ? "DOWN" : "RANGE", color.aqua)
+    tcell(4, "Closed trades", str.tostring(nTr), color.white)
+    tcell(5, "Win rate", nTr > 0 ? str.tostring(100.0 * nWin / nTr, "#.#") + "%" : "-", color.white)
+    tcell(6, "Expectancy (R)", na(expR) ? "-" : str.tostring(expR, "#.##"), na(expR) ? color.gray : expR > 0 ? color.lime : color.red)
+    tcell(7, "Total R", str.tostring(sumR, "#.#"), color.white)
+    tcell(8, "Profit factor (R)", na(pf) ? "-" : str.tostring(pf, "#.##"), color.white)
+    tcell(9, "Long N / exp R", str.tostring(nLng) + " / " + (nLng > 0 ? str.tostring(sumRL / nLng, "#.##") : "-"), color.white)
+    tcell(10, "Short N / exp R", str.tostring(nSht) + " / " + (nSht > 0 ? str.tostring(sumRS / nSht, "#.##") : "-"), color.white)
+
+// ------------------------------- ALERTS ---------------------------------
+alertcondition(longSig, "EURUSD Sweep LONG", "EURUSD: overnight low swept and reclaimed - LONG")
+alertcondition(shortSig, "EURUSD Sweep SHORT", "EURUSD: overnight high swept and reclaimed - SHORT")

@@ -1,0 +1,201 @@
+//@version=5
+indicator("XAUUSD Asian Sweep & Reclaim", shorttitle="XAU ASR", overlay=true, max_lines_count=500, max_labels_count=500)
+
+// =====================================================
+// XAUUSD Asian Range Sweep & Reclaim  (use on M15)
+// Sessions are in GMT. In winter, London opens 07:00 GMT;
+// in summer (BST) shift the session inputs by -1h if you want
+// to track the local London open.
+// =====================================================
+
+TZ = "GMT"
+
+// ---------- Inputs ----------
+gS = "Sessions (GMT)"
+asianS   = input.session("0000-0700", "Asian range",              group=gS)
+win1S    = input.session("0700-1100", "Primary window",           group=gS)
+win2S    = input.session("1230-1530", "Secondary window (NY)",    group=gS)
+lonS     = input.session("0700-0900", "London timing (confluence)", group=gS)
+useWin2  = input.bool(true, "Allow secondary window", group=gS)
+
+gR = "Rules"
+sweepMin    = input.float(1.5, "Min sweep beyond range ($)", step=0.1, group=gR)
+reclaimBars = input.int(3, "Reclaim within N bars", minval=0, group=gR)
+stopBuf     = input.float(1.0, "Stop buffer beyond sweep ($)", step=0.1, group=gR)
+maxStop     = input.float(10.0, "Max stop distance ($)", step=0.5, group=gR)
+minPct      = input.float(25.0, "Min Asian range % of daily ATR", group=gR)
+maxPct      = input.float(60.0, "Max Asian range % of daily ATR", group=gR)
+atrLen      = input.int(14, "Daily ATR length", minval=1, group=gR)
+minRR       = input.float(1.5, "Min R:R to T2 (opposite range side)", step=0.1, group=gR)
+maxTrades   = input.int(2, "Max signals per session", minval=1, group=gR)
+
+gC = "Confluence"
+minScore  = input.int(4, "Min score (of 6)", minval=1, maxval=6, group=gC)
+roundStep = input.float(50.0, "Round-number step ($)", group=gC)
+wickPct   = input.float(0.5, "Rejection wick min % of candle", step=0.05, group=gC)
+volMult   = input.float(1.5, "Volume spike x 20-bar avg", step=0.1, group=gC)
+
+// ---------- Helpers ----------
+inSess(s) => not na(time(timeframe.period, s, TZ))
+
+// ---------- Daily reference levels ----------
+dATR  = request.security(syminfo.tickerid, "D", ta.atr(atrLen)[1], lookahead=barmerge.lookahead_on)
+pdh   = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_on)
+pdl   = request.security(syminfo.tickerid, "D", low[1],  lookahead=barmerge.lookahead_on)
+dOpen = request.security(syminfo.tickerid, "D", open,    lookahead=barmerge.lookahead_on)
+
+// ---------- State ----------
+var float ah = na
+var float al = na
+var float sLow = na
+var float sHigh = na
+var int   sLowBar = na
+var int   sHighBar = na
+var bool  lRej = false
+var bool  lVol = false
+var bool  shRej = false
+var bool  shVol = false
+var bool  longDone = false
+var bool  shortDone = false
+var int   trades = 0
+
+inAsian = inSess(asianS)
+newSess = inAsian and not inAsian[1]
+
+if newSess
+    ah := high
+    al := low
+    sLow := na
+    sHigh := na
+    sLowBar := na
+    sHighBar := na
+    lRej := false
+    lVol := false
+    shRej := false
+    shVol := false
+    longDone := false
+    shortDone := false
+    trades := 0
+else if inAsian
+    ah := na(ah) ? high : math.max(ah, high)
+    al := na(al) ? low  : math.min(al, low)
+
+rangeReady = not inAsian and not na(ah) and not na(al) and not na(dATR)
+rng        = ah - al
+rangePct   = rng / dATR * 100
+rangeOK    = rangePct >= minPct and rangePct <= maxPct
+mid        = (ah + al) / 2
+inWindow   = inSess(win1S) or (useWin2 and inSess(win2S))
+
+// ---------- Candle metrics ----------
+barRng   = high - low
+lowWick  = barRng > 0 ? (math.min(open, close) - low) / barRng : 0.0
+upWick   = barRng > 0 ? (high - math.max(open, close)) / barRng : 0.0
+volSpike = volume > ta.sma(volume, 20) * volMult
+
+// ---------- Expire stale sweeps ----------
+if not na(sLowBar) and bar_index - sLowBar > reclaimBars
+    sLow := na
+    sLowBar := na
+    lRej := false
+    lVol := false
+if not na(sHighBar) and bar_index - sHighBar > reclaimBars
+    sHigh := na
+    sHighBar := na
+    shRej := false
+    shVol := false
+
+// ---------- Sweep tracking ----------
+sweptLow  = rangeReady and not longDone  and low  <= al - sweepMin
+sweptHigh = rangeReady and not shortDone and high >= ah + sweepMin
+
+if sweptLow
+    sLow := na(sLow) ? low : math.min(sLow, low)
+    sLowBar := bar_index
+    lRej := lRej or lowWick >= wickPct
+    lVol := lVol or volSpike
+if sweptHigh
+    sHigh := na(sHigh) ? high : math.max(sHigh, high)
+    sHighBar := bar_index
+    shRej := shRej or upWick >= wickPct
+    shVol := shVol or volSpike
+
+// ---------- Confluence scores ----------
+rnL = math.floor(al / roundStep) * roundStep
+rnH = math.ceil(ah / roundStep) * roundStep
+liqL = (sLow <= pdl) or (rnL >= sLow and rnL <= al)
+liqH = (sHigh >= pdh) or (rnH <= sHigh and rnH >= ah)
+timing = inSess(lonS)
+
+scoreL = 1 + (close > dOpen ? 1 : 0) + (liqL ? 1 : 0) + (lRej ? 1 : 0) + (lVol ? 1 : 0) + (timing ? 1 : 0)
+scoreS = 1 + (close < dOpen ? 1 : 0) + (liqH ? 1 : 0) + (shRej ? 1 : 0) + (shVol ? 1 : 0) + (timing ? 1 : 0)
+
+// ---------- Trade math ----------
+stopL = sLow - stopBuf
+stopS = sHigh + stopBuf
+riskL = close - stopL
+riskS = stopS - close
+rrL   = riskL > 0 ? (ah - close) / riskL : na
+rrS   = riskS > 0 ? (close - al) / riskS : na
+
+// ---------- Signals ----------
+baseOK = rangeReady and rangeOK and inWindow and trades < maxTrades and barstate.isconfirmed
+
+longSig  = baseOK and not longDone  and not na(sLow)  and close > al and riskL > 0 and riskL <= maxStop and scoreL >= minScore and rrL >= minRR
+shortSig = baseOK and not shortDone and not na(sHigh) and close < ah and riskS > 0 and riskS <= maxStop and scoreS >= minScore and rrS >= minRR
+
+drawTrade(isLong, entry, stop, t1, t2, score) =>
+    x2 = bar_index + 20
+    line.new(bar_index, entry, x2, entry, color=color.gray, style=line.style_dashed)
+    line.new(bar_index, stop,  x2, stop,  color=color.red)
+    line.new(bar_index, t1,    x2, t1,    color=color.new(color.green, 20), style=line.style_dotted)
+    line.new(bar_index, t2,    x2, t2,    color=color.green)
+    txt = (isLong ? "LONG " : "SHORT ") + str.tostring(score) + "/6" +
+          "\nSL " + str.tostring(stop, "#.##") +
+          "\nT1 " + str.tostring(t1, "#.##") +
+          "\nT2 " + str.tostring(t2, "#.##")
+    label.new(bar_index, isLong ? low : high, txt,
+              style = isLong ? label.style_label_up : label.style_label_down,
+              color = isLong ? color.green : color.red,
+              textcolor = color.white, size = size.small)
+
+if longSig
+    longDone := true
+    trades += 1
+    drawTrade(true, close, stopL, close + riskL, ah, scoreL)
+
+if shortSig
+    shortDone := true
+    trades += 1
+    drawTrade(false, close, stopS, close - riskS, al, scoreS)
+
+// ---------- Plots ----------
+plot(newSess ? na : ah,  "Asian High", color=color.orange, linewidth=2, style=plot.style_linebr)
+plot(newSess ? na : al,  "Asian Low",  color=color.orange, linewidth=2, style=plot.style_linebr)
+plot(newSess ? na : mid, "Asian Mid",  color=color.new(color.gray, 40), style=plot.style_linebr)
+plot(pdh,   "PDH",        color=color.new(color.purple, 30), style=plot.style_linebr)
+plot(pdl,   "PDL",        color=color.new(color.purple, 30), style=plot.style_linebr)
+plot(dOpen, "Daily Open", color=color.new(color.aqua, 20),   style=plot.style_linebr)
+
+bgcolor(inAsian ? color.new(color.blue, 92) : na, title="Asian session")
+bgcolor(rangeReady and inWindow ? color.new(color.green, 95) : na, title="Trade window")
+
+// ---------- Info table ----------
+var table t = table.new(position.top_right, 2, 6, bgcolor=color.new(color.black, 70), border_width=1)
+if barstate.islast
+    table.cell(t, 0, 0, "Asian High", text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 0, str.tostring(ah, "#.##"), text_color=color.white, text_size=size.small)
+    table.cell(t, 0, 1, "Asian Low", text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 1, str.tostring(al, "#.##"), text_color=color.white, text_size=size.small)
+    table.cell(t, 0, 2, "Range", text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 2, str.tostring(rng, "#.##"), text_color=color.white, text_size=size.small)
+    table.cell(t, 0, 3, "% Daily ATR", text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 3, str.tostring(rangePct, "#.#") + "%", text_color=rangeOK ? color.lime : color.red, text_size=size.small)
+    table.cell(t, 0, 4, "Window", text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 4, inWindow ? "OPEN" : "CLOSED", text_color=inWindow ? color.lime : color.gray, text_size=size.small)
+    table.cell(t, 0, 5, "Signals", text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 5, str.tostring(trades) + "/" + str.tostring(maxTrades), text_color=color.white, text_size=size.small)
+
+// ---------- Alerts ----------
+alertcondition(longSig,  "XAU Asian Sweep LONG",  "XAUUSD: Asian low swept & reclaimed - LONG setup")
+alertcondition(shortSig, "XAU Asian Sweep SHORT", "XAUUSD: Asian high swept & reclaimed - SHORT setup")
